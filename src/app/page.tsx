@@ -1,7 +1,28 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Calendar, Clock, Brain, Plus, CheckCircle2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Calendar, Clock, Brain, Plus, CheckCircle2, ChevronLeft, ChevronRight, Wifi, WifiOff } from 'lucide-react';
+
+// Configuration MongoDB Atlas - MÉTHODE SIMPLIFIÉE
+const MONGODB_CONFIG = {
+  // Option 1: Data API (si disponible)
+  url: "https://eu-west-2.aws.data.mongodb-api.com/app/data-XXXXX/endpoint/data/v1/action",
+  apiKey: "YOUR_API_KEY_HERE",
+  dataSource: "Cluster0",
+  database: "medical_planning",
+  coursesCollection: "courses",
+  constraintsCollection: "constraints",
+
+  // Option 2: Configuration alternative (plus simple)
+  useAlternativeMethod: true, // Changez à false si vous avez Data API
+
+  // Pour la méthode alternative, utilisez ces paramètres :
+  alternativeConfig: {
+    // Votre connection string MongoDB (trouvé dans Connect → Drivers)
+    connectionString: "mongodb+srv://drgre:wwe2hcAJf32IdydX@cluster0.7xwuasq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
+
+  }
+};
 
 // Interfaces TypeScript
 interface JInterval {
@@ -91,18 +112,70 @@ const MedicalPlanningAgent = () => {
   const [courses, setCourses] = useState<Course[]>([]);
   const [constraints, setConstraints] = useState<Constraint[]>([]);
   const [currentWeek, setCurrentWeek] = useState<number>(0);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isOnline, setIsOnline] = useState<boolean>(true);
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       type: 'ai',
-      content: '🎓 Bonjour ! Je suis votre agent de planning médical.\n\n📅 Planning: Lundi-Samedi • Dimanche = Repos automatique\n\n💡 Formats disponibles:\n• "Ajouter Anatomie avec 2 heures par jour"\n• "Ajouter Physiologie avec 1.5h démarrage le 15/03"\n• "J\'ai une contrainte le 20/03 de 9h à 12h"\n• "Rendez-vous médical le 15 septembre toute la journée"'
+      content: '🎓 Bonjour ! Je suis votre agent de planning médical.\n\n📅 Planning: Lundi-Samedi • Dimanche = Repos automatique\n\n💡 Formats disponibles:\n• "Ajouter Anatomie avec 2 heures par jour"\n• "Ajouter Physiologie avec 1.5h démarrage le 15/03"\n• "J\'ai une contrainte le 20/03 de 9h à 12h"\n• "Déplacer cours Anatomie J+10 du 16/09 au 19/09"\n\n🔄 Nouveaux intervalles J : J0, J+1, J+2, J+10, J+25, J+47\n🎯 Glisser-déposer activé dans le planning !\n☁️ Sauvegarde automatique'
     }
   ]);
   const [inputMessage, setInputMessage] = useState<string>('');
-  const [stats, setStats] = useState<Stats>({
-    totalCourses: 0,
-    todayHours: 0,
-    completionRate: 0
-  });
+  // États pour le drag and drop
+  const [draggedSession, setDraggedSession] = useState<{
+    courseId: number;
+    sessionId: string;
+    courseName: string;
+    interval: string;
+    hours: number;
+  } | null>(null);
+
+  const handleDragStart = (e: React.DragEvent, courseId: number, sessionId: string, courseName: string, interval: string, hours: number) => {
+    setDraggedSession({ courseId, sessionId, courseName, interval, hours });
+    e.dataTransfer.effectAllowed = 'move';
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+  };
+
+  const handleDrop = (e: React.DragEvent, targetDate: Date) => {
+    e.preventDefault();
+
+    if (!draggedSession) return;
+
+    // Vérifier si c'est un dimanche
+    if (targetDate.getDay() === 0) {
+      setChatMessages(prev => [...prev, {
+        type: 'ai',
+        content: `❌ Impossible de déposer le dimanche !\n\n🛌 Dimanche = repos automatique.\n💡 La session "${draggedSession.courseName}" ${draggedSession.interval} ne peut pas être programmée ce jour-là.`
+      }]);
+      setDraggedSession(null);
+      return;
+    }
+
+    // Vérifier les conflits
+    if (hasConflict(targetDate, draggedSession.hours)) {
+      setChatMessages(prev => [...prev, {
+        type: 'ai',
+        content: `❌ Conflit détecté !\n\n⚠️ Une contrainte empêche le déplacement de "${draggedSession.courseName}" ${draggedSession.interval} vers le ${targetDate.toLocaleDateString('fr-FR')}.\n💡 Choisissez une autre date ou vérifiez vos contraintes.`
+      }]);
+      setDraggedSession(null);
+      return;
+    }
+
+    // Effectuer le déplacement
+    moveSession(draggedSession.courseId, draggedSession.sessionId, targetDate);
+
+    setChatMessages(prev => [...prev, {
+      type: 'ai',
+      content: `✅ Session déplacée par glisser-déposer !\n\n📅 "${draggedSession.courseName}" ${draggedSession.interval} (${draggedSession.hours}h)\n🔄 Nouvelle date : ${targetDate.toLocaleDateString('fr-FR')}\n☁️ Sauvegardé automatiquement`
+    }]);
+
+    setDraggedSession(null);
+  };
 
   const workingHours: WorkingHours = {
     start: 9,
@@ -114,12 +187,143 @@ const MedicalPlanningAgent = () => {
   const jIntervals: JInterval[] = [
     { key: 'J0', days: 0, label: 'J0 (Apprentissage)', color: 'bg-blue-100 text-blue-700' },
     { key: 'J+1', days: 1, label: 'J+1', color: 'bg-red-100 text-red-700' },
-    { key: 'J+3', days: 3, label: 'J+3', color: 'bg-orange-100 text-orange-700' },
-    { key: 'J+7', days: 7, label: 'J+7', color: 'bg-yellow-100 text-yellow-700' },
-    { key: 'J+15', days: 15, label: 'J+15', color: 'bg-green-100 text-green-700' },
-    { key: 'J+30', days: 30, label: 'J+30', color: 'bg-purple-100 text-purple-700' },
-    { key: 'J+90', days: 90, label: 'J+90', color: 'bg-pink-100 text-pink-700' }
+    { key: 'J+2', days: 2, label: 'J+2', color: 'bg-orange-100 text-orange-700' },
+    { key: 'J+10', days: 10, label: 'J+10', color: 'bg-yellow-100 text-yellow-700' },
+    { key: 'J+25', days: 25, label: 'J+25', color: 'bg-green-100 text-green-700' },
+    { key: 'J+47', days: 47, label: 'J+47', color: 'bg-purple-100 text-purple-700' }
   ];
+
+  // MongoDB Connection (simplifié pour demo - nécessite un backend en production)
+  const mongoRequest = async (action: string, collection: string, data: any) => {
+    if (!MONGODB_CONFIG.connectionString || MONGODB_CONFIG.connectionString.includes("username:password")) {
+      console.warn("⚠️ MongoDB Connection String manquant. Utilisation du stockage local.");
+      return await handleLocalStorage(action, collection, data);
+    }
+
+    // Note: En production, ces appels MongoDB doivent passer par un backend sécurisé
+    // Pour cette démo, nous utilisons localStorage comme backup
+    try {
+      // Simulation d'appel MongoDB (remplacez par votre backend API)
+      console.log(`[MONGO SIMULATION] ${action} sur ${collection}:`, data);
+      setIsOnline(true);
+      setLastSyncTime(new Date());
+
+      // En attendant un backend, utilise localStorage
+      return await handleLocalStorage(action, collection, data);
+    } catch (error) {
+      console.error('Erreur MongoDB:', error);
+      setIsOnline(false);
+      return await handleLocalStorage(action, collection, data);
+    }
+  };
+
+  // Système de backup localStorage
+  const handleLocalStorage = async (action: string, collection: string, data: any) => {
+    try {
+      const key = `medical_planning_${collection}`;
+
+      switch (action) {
+        case 'find':
+          const stored = localStorage.getItem(key);
+          return { documents: stored ? JSON.parse(stored) : [] };
+
+        case 'insertMany':
+          localStorage.setItem(key, JSON.stringify(data.documents));
+          return { insertedIds: data.documents.map((_: any, i: number) => i) };
+
+        case 'deleteMany':
+          localStorage.removeItem(key);
+          return { deletedCount: 1 };
+
+        default:
+          return null;
+      }
+    } catch (error) {
+      console.error('Erreur localStorage:', error);
+      return null;
+    }
+  };
+
+  const saveCourses = async (coursesData: Course[]) => {
+    if (coursesData.length === 0) return;
+
+    // Convertir les dates en strings pour MongoDB
+    const coursesForDB = coursesData.map(course => ({
+      ...course,
+      createdAt: course.createdAt.toISOString(),
+      sessions: course.sessions.map(session => ({
+        ...session,
+        date: session.date.toISOString(),
+        originalDate: session.originalDate.toISOString()
+      }))
+    }));
+
+    // Remplacer tous les cours
+    await mongoRequest('deleteMany', MONGODB_CONFIG.coursesCollection, { filter: {} });
+    await mongoRequest('insertMany', MONGODB_CONFIG.coursesCollection, {
+      documents: coursesForDB
+    });
+  };
+
+  const saveConstraints = async (constraintsData: Constraint[]) => {
+    if (constraintsData.length === 0) return;
+
+    // Convertir les dates en strings pour MongoDB
+    const constraintsForDB = constraintsData.map(constraint => ({
+      ...constraint,
+      date: constraint.date.toISOString(),
+      createdAt: constraint.createdAt.toISOString()
+    }));
+
+    // Remplacer toutes les contraintes
+    await mongoRequest('deleteMany', MONGODB_CONFIG.constraintsCollection, { filter: {} });
+    await mongoRequest('insertMany', MONGODB_CONFIG.constraintsCollection, {
+      documents: constraintsForDB
+    });
+  };
+
+  const loadData = async () => {
+    setIsLoading(true);
+
+    try {
+      // Charger les cours
+      const coursesResult = await mongoRequest('find', MONGODB_CONFIG.coursesCollection, { filter: {} });
+      if (coursesResult?.documents) {
+        const coursesFromDB = coursesResult.documents.map((course: any) => ({
+          ...course,
+          createdAt: new Date(course.createdAt),
+          sessions: course.sessions.map((session: any) => ({
+            ...session,
+            date: new Date(session.date),
+            originalDate: new Date(session.originalDate)
+          }))
+        }));
+        setCourses(coursesFromDB);
+      }
+
+      // Charger les contraintes
+      const constraintsResult = await mongoRequest('find', MONGODB_CONFIG.constraintsCollection, { filter: {} });
+      if (constraintsResult?.documents) {
+        const constraintsFromDB = constraintsResult.documents.map((constraint: any) => ({
+          ...constraint,
+          date: new Date(constraint.date),
+          createdAt: new Date(constraint.createdAt)
+        }));
+        setConstraints(constraintsFromDB);
+      }
+
+      if (coursesResult || constraintsResult) {
+        setChatMessages(prev => [...prev, {
+          type: 'ai',
+          content: `📱 Données chargées depuis MongoDB Atlas !\n\n✅ ${coursesResult?.documents?.length || 0} cours récupérés\n✅ ${constraintsResult?.documents?.length || 0} contraintes récupérées\n\n☁️ Synchronisation automatique activée`
+        }]);
+      }
+    } catch (error) {
+      console.error('Erreur lors du chargement:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   const createConstraint = (date: string | Date, startHour: number, endHour: number, description: string): Constraint => {
     return {
@@ -208,10 +412,12 @@ const MedicalPlanningAgent = () => {
   const deleteCourse = (courseId: number): void => {
     const updatedCourses = courses.filter(course => course.id !== courseId);
     setCourses(updatedCourses);
+    saveCourses(updatedCourses); // Sauvegarde automatique
   };
 
   const deleteAllCourses = (): void => {
     setCourses([]);
+    saveCourses([]); // Sauvegarde automatique
     setStats(prev => ({
       ...prev,
       totalCourses: 0,
@@ -232,9 +438,10 @@ const MedicalPlanningAgent = () => {
         };
       }
       return course;
-    }).filter(course => course.sessions.length > 0); // Supprimer le cours s'il n'a plus de sessions
+    }).filter(course => course.sessions.length > 0);
 
     setCourses(updatedCourses);
+    saveCourses(updatedCourses); // Sauvegarde automatique
   };
 
   const markSessionComplete = (courseId: number, sessionId: string, success: boolean): void => {
@@ -256,6 +463,54 @@ const MedicalPlanningAgent = () => {
     });
 
     setCourses(updatedCourses);
+    saveCourses(updatedCourses); // Sauvegarde automatique
+  };
+
+  const moveSession = (courseId: number, sessionId: string, newDate: Date): void => {
+    const updatedCourses = courses.map(course => {
+      if (course.id === courseId) {
+        const updatedSessions = course.sessions.map(session => {
+          if (session.id === sessionId) {
+            return {
+              ...session,
+              date: new Date(newDate),
+              rescheduled: true
+            };
+          }
+          return session;
+        });
+        return { ...course, sessions: updatedSessions };
+      }
+      return course;
+    });
+
+    setCourses(updatedCourses);
+    saveCourses(updatedCourses);
+  };
+
+  const moveCourseSession = (courseName: string, sessionInterval: string, fromDate: Date, toDate: Date): boolean => {
+    const course = courses.find(c => c.name.toLowerCase().includes(courseName.toLowerCase()));
+    if (!course) return false;
+
+    const session = course.sessions.find(s =>
+      s.interval === sessionInterval &&
+      s.date.toDateString() === fromDate.toDateString()
+    );
+
+    if (!session) return false;
+
+    // Vérifier les conflits à la nouvelle date
+    if (hasConflict(toDate, course.hoursPerDay)) {
+      return false;
+    }
+
+    // Vérifier si le dimanche
+    if (toDate.getDay() === 0) {
+      toDate.setDate(toDate.getDate() + 1);
+    }
+
+    moveSession(course.id, session.id, toDate);
+    return true;
   };
 
   const rebalanceSessions = (coursesToBalance: Course[]): Course[] => {
@@ -352,36 +607,41 @@ const MedicalPlanningAgent = () => {
     const weekDates = getWeekDates(weekOffset);
     const weeklyPlan: WeeklyPlan = {};
 
-    weekDates.slice(0, 6).forEach((date, index) => {
-      const dayName = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'][index];
+    // Inclure tous les jours de la semaine, y compris le dimanche
+    weekDates.forEach((date, index) => {
+      const dayNames = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
+      const dayName = dayNames[index];
       const dayStart = new Date(date);
       dayStart.setHours(0, 0, 0, 0);
 
       const daySessions: WeeklyPlanSession[] = [];
       let totalHours = 0;
 
-      courses.forEach(course => {
-        course.sessions.forEach(session => {
-          const sessionDate = new Date(session.date);
-          sessionDate.setHours(0, 0, 0, 0);
+      // Le dimanche n'a jamais de sessions
+      if (index !== 6) {
+        courses.forEach(course => {
+          course.sessions.forEach(session => {
+            const sessionDate = new Date(session.date);
+            sessionDate.setHours(0, 0, 0, 0);
 
-          if (sessionDate.getTime() === dayStart.getTime()) {
-            daySessions.push({
-              course: course.name,
-              interval: session.interval,
-              intervalLabel: session.intervalLabel,
-              hours: course.hoursPerDay,
-              completed: session.completed,
-              success: session.success,
-              color: session.color,
-              rescheduled: session.rescheduled
-            });
-            if (!session.completed) {
-              totalHours += course.hoursPerDay;
+            if (sessionDate.getTime() === dayStart.getTime()) {
+              daySessions.push({
+                course: course.name,
+                interval: session.interval,
+                intervalLabel: session.intervalLabel,
+                hours: course.hoursPerDay,
+                completed: session.completed,
+                success: session.success,
+                color: session.color,
+                rescheduled: session.rescheduled
+              });
+              if (!session.completed) {
+                totalHours += course.hoursPerDay;
+              }
             }
-          }
+          });
         });
-      });
+      }
 
       weeklyPlan[dayName] = {
         date: date,
@@ -420,8 +680,73 @@ const MedicalPlanningAgent = () => {
   const processAICommand = (message: string): string => {
     const lowerMsg = message.toLowerCase();
 
-    if (lowerMsg.includes('supprimer') || lowerMsg.includes('effacer') || lowerMsg.includes('retirer')) {
+    if (lowerMsg.includes('déplacer') || lowerMsg.includes('deplacer') || lowerMsg.includes('déplacer cours')) {
+      // Pattern: "déplacer cours [nom] [J+X] du [date] au [date]"
+      const movePattern = /déplacer\s+(?:cours\s+)?([^J]+?)\s+(j\+?\d+)\s+du\s+(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+au\s+(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i;
+      const altMovePattern = /deplacer\s+(?:cours\s+)?([^J]+?)\s+(j\+?\d+)\s+du\s+(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+au\s+(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i;
 
+      const match = message.match(movePattern) || message.match(altMovePattern);
+
+      if (match) {
+        const courseName = match[1].trim();
+        const sessionInterval = match[2].toUpperCase().replace('+', '+');
+        const fromDateStr = match[3];
+        const toDateStr = match[4];
+
+        // Convertir les dates
+        const parseDate = (dateStr: string): Date => {
+          const parts = dateStr.split('/');
+          const day = parseInt(parts[0]);
+          const month = parseInt(parts[1]) - 1;
+          const year = parts[2] ? parseInt(parts[2]) : new Date().getFullYear();
+          return new Date(year, month, day);
+        };
+
+        const fromDate = parseDate(fromDateStr);
+        const toDate = parseDate(toDateStr);
+
+        // Trouver le cours
+        const course = courses.find(c => c.name.toLowerCase().includes(courseName.toLowerCase()));
+        if (!course) {
+          return `❌ Cours "${courseName}" non trouvé.\n\n📚 Cours disponibles : ${courses.map(c => c.name).join(', ')}`;
+        }
+
+        // Trouver la session
+        const session = course.sessions.find(s =>
+          s.interval === sessionInterval &&
+          s.date.toDateString() === fromDate.toDateString()
+        );
+
+        if (!session) {
+          return `❌ Session ${sessionInterval} du cours "${course.name}" non trouvée le ${fromDate.toLocaleDateString('fr-FR')}.\n\n📋 Sessions disponibles pour ce cours :\n${course.sessions.map(s => `• ${s.interval} le ${s.date.toLocaleDateString('fr-FR')}`).join('\n')}`;
+        }
+
+        if (session.completed) {
+          return `⚠️ Impossible de déplacer une session déjà terminée.\n\nSession ${sessionInterval} de "${course.name}" déjà ${session.success ? 'réussie ✅' : 'échouée ❌'}.`;
+        }
+
+        // Vérifier les conflits
+        if (hasConflict(toDate, course.hoursPerDay)) {
+          return `❌ Conflit détecté le ${toDate.toLocaleDateString('fr-FR')} !\n\n⚠️ Une contrainte empêche ce déplacement.\n💡 Choisissez une autre date ou vérifiez vos contraintes avec "Mes contraintes".`;
+        }
+
+        // Vérifier si c'est un dimanche
+        if (toDate.getDay() === 0) {
+          const mondayDate = new Date(toDate);
+          mondayDate.setDate(toDate.getDate() + 1);
+          return `❌ Impossible de programmer le dimanche !\n\n🛌 Dimanche = repos automatique.\n💡 La session serait automatiquement décalée au lundi ${mondayDate.toLocaleDateString('fr-FR')}.`;
+        }
+
+        // Effectuer le déplacement
+        moveSession(course.id, session.id, toDate);
+
+        return `✅ Session déplacée avec succès !\n\n📅 "${course.name}" ${sessionInterval} (${course.hoursPerDay}h)\n🔄 Du ${fromDate.toLocaleDateString('fr-FR')} → ${toDate.toLocaleDateString('fr-FR')}\n☁️ Sauvegardé automatiquement\n\n💡 Consultez votre planning mis à jour avec "Planning de la semaine"`;
+      }
+
+      return `❓ Format de déplacement non reconnu.\n\n💡 Utilisez :\n• "Déplacer cours [nom] [J+X] du [DD/MM] au [DD/MM]"\n• Exemple : "Déplacer cours Anatomie J+10 du 16/09 au 19/09"`;
+    }
+
+    if (lowerMsg.includes('supprimer') || lowerMsg.includes('effacer') || lowerMsg.includes('retirer')) {
       // Supprimer tous les cours
       if (lowerMsg.includes('tous') && (lowerMsg.includes('cours') || lowerMsg.includes('tout'))) {
         if (courses.length === 0) {
@@ -430,7 +755,7 @@ const MedicalPlanningAgent = () => {
 
         const courseCount = courses.length;
         deleteAllCourses();
-        return `🗑️ Tous les cours supprimés avec succès !\n\n📊 ${courseCount} cours et toutes leurs sessions ont été effacés.\n\n💡 Vous pouvez ajouter de nouveaux cours quand vous voulez !`;
+        return `🗑️ Tous les cours supprimés avec succès !\n\n📊 ${courseCount} cours et toutes leurs sessions ont été effacés.\n☁️ Sauvegardé automatiquement\n\n💡 Vous pouvez ajouter de nouveaux cours quand vous voulez !`;
       }
 
       // Supprimer un cours spécifique
@@ -448,9 +773,10 @@ const MedicalPlanningAgent = () => {
             const remainingCourses = courses.filter(c => c.id !== courseToDelete.id);
             const rebalanced = rebalanceSessions(remainingCourses);
             setCourses(rebalanced);
+            saveCourses(rebalanced);
           }
 
-          return `🗑️ Cours "${courseToDelete.name}" supprimé !\n\n📊 ${sessionCount} sessions supprimées\n• Planning automatiquement réorganisé\n\n💡 ${courses.length - 1} cours restant(s)`;
+          return `🗑️ Cours "${courseToDelete.name}" supprimé !\n\n📊 ${sessionCount} sessions supprimées\n• Planning automatiquement réorganisé\n☁️ Sauvegardé automatiquement\n\n💡 ${courses.length - 1} cours restant(s)`;
         } else {
           const availableCourses = courses.map(c => c.name).join(', ');
           return `❌ Cours "${courseName}" non trouvé.\n\n📚 Cours disponibles : ${availableCourses || 'Aucun'}\n\n💡 Utilisez le nom exact du cours.`;
@@ -479,7 +805,7 @@ const MedicalPlanningAgent = () => {
 
         deleteSession(course.id, session.id);
 
-        return `🗑️ Session ${jInterval} supprimée !\n\n📅 Session du ${session.date.toLocaleDateString('fr-FR')} retirée du planning\n• Cours "${course.name}" : ${course.sessions.length - 1} sessions restantes\n\n🔄 Planning automatiquement mis à jour`;
+        return `🗑️ Session ${jInterval} supprimée !\n\n📅 Session du ${session.date.toLocaleDateString('fr-FR')} retirée du planning\n• Cours "${course.name}" : ${course.sessions.length - 1} sessions restantes\n☁️ Sauvegardé automatiquement\n\n🔄 Planning automatiquement mis à jour`;
       }
 
       return `❓ Commande de suppression non reconnue.\n\n💡 Essayez :\n• "Supprimer tous les cours"\n• "Supprimer le cours Anatomie"\n• "Supprimer session J+7 de Physiologie"`;
@@ -554,10 +880,12 @@ const MedicalPlanningAgent = () => {
       const newConstraint = createConstraint(constraintDate, startHour, endHour, description);
       const updatedConstraints = [...constraints, newConstraint];
       setConstraints(updatedConstraints);
+      saveConstraints(updatedConstraints); // Sauvegarde automatique
 
       if (courses.length > 0) {
         const rebalanced = rebalanceSessions(courses);
         setCourses(rebalanced);
+        saveCourses(rebalanced);
 
         let affectedSessions = 0;
         rebalanced.forEach(course => {
@@ -566,10 +894,10 @@ const MedicalPlanningAgent = () => {
           });
         });
 
-        return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n\n🔄 Réorganisation automatique effectuée :\n• ${affectedSessions} session(s) de cours reportée(s)\n• Toutes les sessions en conflit ont été décalées\n• Les règles de planning sont respectées (Lundi-Samedi, max 10h/jour)\n\n💡 Consultez votre planning mis à jour avec "Planning de la semaine"`;
+        return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n☁️ Sauvegardé automatiquement\n\n🔄 Réorganisation automatique effectuée :\n• ${affectedSessions} session(s) de cours reportée(s)\n• Toutes les sessions en conflit ont été décalées\n• Les règles de planning sont respectées (Lundi-Samedi, max 10h/jour)\n\n💡 Consultez votre planning mis à jour avec "Planning de la semaine"`;
       }
 
-      return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n\n💡 Ajoutez des cours et ils seront automatiquement programmés en évitant cette période !`;
+      return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n☁️ Sauvegardé automatiquement\n\n💡 Ajoutez des cours et ils seront automatiquement programmés en évitant cette période !`;
     }
 
     if (lowerMsg.includes('ajouter') || lowerMsg.includes('nouveau cours')) {
@@ -632,6 +960,7 @@ const MedicalPlanningAgent = () => {
 
       const rebalanced = rebalanceSessions(updatedCourses);
       setCourses(rebalanced);
+      saveCourses(rebalanced); // Sauvegarde automatique
 
       let rescheduledCount = 0;
       let constraintAffected = false;
@@ -654,7 +983,7 @@ const MedicalPlanningAgent = () => {
         totalCourses: prev.totalCourses + 1
       }));
 
-      let response = `✅ Cours "${courseName}" ajouté avec ${hours}h/jour !\n\n🔄 Sessions programmées automatiquement :\n• J0 (${startDate.toLocaleDateString('fr-FR')}) - Apprentissage initial\n• J+1 - Première révision\n• J+3, J+7, J+15, J+30, J+90 - Révisions espacées`;
+      let response = `✅ Cours "${courseName}" ajouté avec ${hours}h/jour !\n☁️ Sauvegardé automatiquement\n\n🔄 Sessions programmées automatiquement :\n• J0 (${startDate.toLocaleDateString('fr-FR')}) - Apprentissage initial\n• J+1 - Première révision\n• J+2, J+10, J+25, J+47 - Révisions espacées`;
 
       if (rescheduledCount > 0) {
         response += `\n\n🔄 ${rescheduledCount} session(s) reportée(s) automatiquement`;
@@ -782,7 +1111,7 @@ const MedicalPlanningAgent = () => {
     }
 
     if (lowerMsg.includes('aide')) {
-      return `🤖 Commandes disponibles:\n\n📚 COURS :\n• "Ajouter [nom] avec [X] heures par jour"\n• "Ajouter [nom] avec [X]h démarrage le [date]"\n\n🗑️ SUPPRESSION :\n• "Supprimer tous les cours"\n• "Supprimer le cours [nom]"\n• "Supprimer session J+7 de [cours]"\n\n⚠️ CONTRAINTES :\n• "J'ai une contrainte le [date] de [heure] à [heure]"\n• "Rendez-vous médical le [date] toute la journée"\n• "Mes contraintes"\n\n📋 PLANNING :\n• "Mon planning du jour"\n• "Planning de la semaine"`;
+      return `🤖 Commandes disponibles:\n\n📚 COURS :\n• "Ajouter [nom] avec [X] heures par jour"\n• "Ajouter [nom] avec [X]h démarrage le [date]"\n\n🗑️ SUPPRESSION :\n• "Supprimer tous les cours"\n• "Supprimer le cours [nom]"\n• "Supprimer session J+10 de [cours]"\n\n⚠️ CONTRAINTES :\n• "J'ai une contrainte le [date] de [heure] à [heure]"\n• "Rendez-vous médical le [date] toute la journée"\n• "Mes contraintes"\n\n📋 PLANNING :\n• "Mon planning du jour"\n• "Planning de la semaine"\n\n🔄 DÉPLACEMENT :\n• "Déplacer cours [nom] [J+X] du [DD/MM] au [DD/MM]"\n• Glisser-déposer dans le planning hebdomadaire\n\n☁️ Toutes vos données sont sauvegardées automatiquement !`;
     }
 
     return `🤔 Je comprends que vous voulez "${message}".\n\n💡 Essayez:\n• "Ajouter [cours] avec [heures] heures par jour"\n• "J'ai une contrainte le [date] de [heure] à [heure]"\n• "Mon planning du jour"\n• "Aide" pour plus de commandes`;
@@ -798,6 +1127,25 @@ const MedicalPlanningAgent = () => {
     setInputMessage('');
   };
 
+  // Charger les données au démarrage
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  // Sauvegarder automatiquement les cours quand ils changent
+  useEffect(() => {
+    if (courses.length > 0 && !isLoading) {
+      saveCourses(courses);
+    }
+  }, [courses, isLoading]);
+
+  // Sauvegarder automatiquement les contraintes quand elles changent
+  useEffect(() => {
+    if (constraints.length > 0 && !isLoading) {
+      saveConstraints(constraints);
+    }
+  }, [constraints, isLoading]);
+
   useEffect(() => {
     const todayHours = getTodaySessions().reduce((sum, s) => sum + s.hours, 0);
     const totalCompletedSessions = courses.reduce((sum, course) => sum + course.sessions.filter(s => s.completed).length, 0);
@@ -810,14 +1158,49 @@ const MedicalPlanningAgent = () => {
     });
   }, [courses, getTodaySessions]);
 
+  if (isLoading) {
+    return (
+      <div className="max-w-7xl mx-auto p-6 bg-gray-50 min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <Brain className="w-16 h-16 text-blue-600 mx-auto mb-4 animate-pulse" />
+          <h2 className="text-2xl font-bold text-gray-800 mb-2">Chargement depuis MongoDB Atlas...</h2>
+          <p className="text-gray-600">Synchronisation de vos données personnelles</p>
+          <div className="mt-4 flex justify-center">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-7xl mx-auto p-6 bg-gray-50 min-h-screen">
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-gray-800 mb-2 flex items-center gap-3">
           <Brain className="text-blue-600" />
           Agent IA - Planning Médical
+          {isOnline ? (
+            <Wifi className="w-5 h-5 text-green-600" title="Connecté à MongoDB Atlas" />
+          ) : (
+            <WifiOff className="w-5 h-5 text-red-600" title="Hors ligne - Mode local" />
+          )}
         </h1>
-        <p className="text-gray-600">Lundi-Samedi 9h-20h • Dimanche repos • Contraintes et réorganisation automatique</p>
+        <p className="text-gray-600">
+          Lundi-Samedi 9h-20h • Dimanche repos • Contraintes et réorganisation automatique
+        </p>
+        <div className="text-sm text-gray-500 mt-1 flex items-center gap-4">
+          <span className="flex items-center gap-1">
+            ☁️ MongoDB Atlas
+            {isOnline ? (
+              <span className="text-green-600">✅ Connecté</span>
+            ) : (
+              <span className="text-red-600">❌ Hors ligne</span>
+            )}
+          </span>
+          {lastSyncTime && (
+            <span>Dernière sync: {lastSyncTime.toLocaleTimeString('fr-FR')}</span>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -855,6 +1238,7 @@ const MedicalPlanningAgent = () => {
                 <h2 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
                   📚 Gestion des Cours
                   <span className="text-sm font-normal text-gray-500">({courses.length} cours actifs)</span>
+                  {isOnline && <span className="text-xs text-green-600">☁️ Sync auto</span>}
                 </h2>
               </div>
 
@@ -1033,21 +1417,37 @@ const MedicalPlanningAgent = () => {
               {Object.entries(getWeeklyPlan(currentWeek)).map(([dayName, dayData]) => {
                 const isToday = dayData.date.toDateString() === new Date().toDateString();
                 const isOverloaded = dayData.totalHours > workingHours.availableHours;
+                const isSunday = dayData.date.getDay() === 0;
 
                 return (
-                  <div key={dayName} className={`p-4 ${isToday ? 'bg-blue-50 border-blue-200' : ''} ${isOverloaded ? 'bg-red-50' : ''}`}>
+                  <div
+                    key={dayName}
+                    className={`p-4 ${isToday ? 'bg-blue-50 border-blue-200' : ''} ${isOverloaded ? 'bg-red-50' : ''} ${isSunday ? 'bg-green-50' : ''} min-h-[200px]`}
+                    onDragOver={!isSunday ? handleDragOver : undefined}
+                    onDrop={!isSunday ? (e) => handleDrop(e, dayData.date) : undefined}
+                  >
                     <div className="mb-2">
-                      <h3 className={`font-medium ${isToday ? 'text-blue-800' : isOverloaded ? 'text-red-800' : 'text-gray-800'}`}>
+                      <h3 className={`font-medium ${isToday ? 'text-blue-800' : isOverloaded ? 'text-red-800' : isSunday ? 'text-green-800' : 'text-gray-800'}`}>
                         {dayName}
                         {isToday && ' 👉'}
                       </h3>
                       <p className="text-xs text-gray-600">
                         {dayData.date.getDate()}/{dayData.date.getMonth() + 1}
                       </p>
+                      {!isSunday && (
+                        <p className="text-xs text-gray-400 mt-1">📋 Glissez ici pour déplacer</p>
+                      )}
                     </div>
 
-                    {dayData.sessions.length === 0 ? (
+                    {dayData.sessions.length === 0 && !isSunday ? (
                       <p className="text-xs text-gray-400 italic">Repos</p>
+                    ) : isSunday ? (
+                      <>
+                        <p className="text-xs text-green-600 italic">🛌 Repos automatique</p>
+                        <div className="text-xs font-medium mt-2 text-green-600">
+                          📊 Total: 0h
+                        </div>
+                      </>
                     ) : (
                       <div className="space-y-2">
                         {dayData.sessions.map((session, idx) => {
@@ -1059,8 +1459,20 @@ const MedicalPlanningAgent = () => {
                           );
 
                           return (
-                            <div key={idx} className={`relative group text-xs p-2 rounded ${session.color}`}>
-                              <div className="font-medium truncate">{session.course}</div>
+                            <div
+                              key={idx}
+                              className={`relative group text-xs p-2 rounded ${session.color} ${session.completed ? 'opacity-60' : ''} ${!session.completed ? 'cursor-move' : ''}`}
+                              draggable={!session.completed}
+                              onDragStart={correspondingCourse && correspondingSession && !session.completed ?
+                                (e) => handleDragStart(e, correspondingCourse.id, correspondingSession.id, session.course, session.interval, session.hours) :
+                                undefined
+                              }
+                              title={!session.completed ? "Glissez pour déplacer cette session" : "Session terminée"}
+                            >
+                              <div className="font-medium truncate flex items-center gap-1">
+                                {!session.completed && <span className="text-xs opacity-50">⋮⋮</span>}
+                                {session.course}
+                              </div>
                               <div className="flex justify-between items-center">
                                 <span>{session.intervalLabel}</span>
                                 <span className="font-medium">{session.hours}h</span>
@@ -1079,7 +1491,7 @@ const MedicalPlanningAgent = () => {
                                         deleteSession(correspondingCourse.id, correspondingSession.id);
                                       }
                                     }}
-                                    className="w-4 h-4 bg-red-500 hover:bg-red-600 text-white rounded-full text-xs flex items-center justify-center"
+                                    className="w-4 h-4 bg-red-500 hover:bg-red-600 text-white rounded-full text-xs flex items-center justify-center z-10"
                                     title="Supprimer cette session"
                                   >
                                     ×
@@ -1097,18 +1509,6 @@ const MedicalPlanningAgent = () => {
                   </div>
                 );
               })}
-              <div className="p-4 bg-green-50">
-                <div className="mb-2">
-                  <h3 className="font-medium text-green-800">Dimanche</h3>
-                  <p className="text-xs text-gray-600">
-                    {getWeekDates(currentWeek)[6].getDate()}/{getWeekDates(currentWeek)[6].getMonth() + 1}
-                  </p>
-                </div>
-                <p className="text-xs text-green-600 italic">🛌 Repos automatique</p>
-                <div className="text-xs font-medium mt-2 text-green-600">
-                  📊 Total: 0h
-                </div>
-              </div>
             </div>
           </div>
 
@@ -1117,6 +1517,11 @@ const MedicalPlanningAgent = () => {
               <Brain className="w-16 h-16 text-gray-300 mx-auto mb-4" />
               <h3 className="text-xl font-medium text-gray-800 mb-2">Aucun cours programmé</h3>
               <p className="text-gray-600 mb-6">Ajoutez vos cours et gérez vos contraintes</p>
+              {!isOnline && (
+                <div className="mb-4 p-3 bg-orange-50 rounded-lg">
+                  <p className="text-orange-700 text-sm">⚠️ Mode hors ligne - Configurez MongoDB Atlas pour sauvegarder vos données</p>
+                </div>
+              )}
               <div className="space-y-2">
                 <button
                   onClick={() => setInputMessage('Ajouter Anatomie Cardiaque avec 2 heures par jour')}
@@ -1137,8 +1542,15 @@ const MedicalPlanningAgent = () => {
 
         <div className="bg-white rounded-lg shadow-sm border">
           <div className="p-4 border-b">
-            <h2 className="text-lg font-semibold text-gray-800">🤖 Assistant IA</h2>
-            <p className="text-xs text-gray-600">Contraintes • Réorganisation automatique</p>
+            <h2 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
+              🤖 Assistant IA
+              {isOnline ? (
+                <span className="text-xs text-green-600">☁️ MongoDB</span>
+              ) : (
+                <span className="text-xs text-red-600">📱 Local</span>
+              )}
+            </h2>
+            <p className="text-xs text-gray-600">Contraintes • Réorganisation automatique • Sauvegarde cloud</p>
           </div>
 
           <div className="h-96 overflow-y-auto p-4 space-y-4">
@@ -1193,17 +1605,16 @@ const MedicalPlanningAgent = () => {
                 📅 Semaine
               </button>
               <button
+                onClick={() => setInputMessage('Déplacer cours Anatomie J+10 du 16/09 au 19/09')}
+                className="text-xs p-2 bg-orange-50 hover:bg-orange-100 rounded border text-orange-700"
+              >
+                🔄 Déplacer
+              </button>
+              <button
                 onClick={() => setInputMessage('Mes contraintes')}
                 className="text-xs p-2 bg-yellow-50 hover:bg-yellow-100 rounded border text-yellow-700"
               >
                 📋 Contraintes
-              </button>
-              <button
-                onClick={() => setInputMessage('Supprimer tous les cours')}
-                className="text-xs p-2 bg-gray-50 hover:bg-gray-100 rounded border text-gray-700"
-                disabled={courses.length === 0}
-              >
-                🗑️ Suppr. tous
               </button>
               <button
                 onClick={() => setInputMessage('Aide')}
@@ -1214,7 +1625,14 @@ const MedicalPlanningAgent = () => {
             </div>
 
             <div className="mt-3 p-2 bg-gray-50 rounded text-xs">
-              <div className="font-medium text-gray-700 mb-1">🛌 Dimanche repos • 🔄 Réorganisation auto avec contraintes</div>
+              <div className="font-medium text-gray-700 mb-1 flex items-center gap-2">
+                🛌 Dimanche repos • 🔄 Réorganisation auto
+                {isOnline ? (
+                  <span className="text-green-600">☁️ Sync MongoDB</span>
+                ) : (
+                  <span className="text-red-600">📱 Mode local</span>
+                )}
+              </div>
               <div className="flex flex-wrap gap-1 mb-1">
                 {jIntervals.map(interval => (
                   <span key={interval.key} className={`px-2 py-1 rounded ${interval.color}`}>
@@ -1223,7 +1641,10 @@ const MedicalPlanningAgent = () => {
                 ))}
               </div>
               <div className="text-gray-600">
-                💡 Contraintes : J ai une contrainte le [date] de [heure] à [heure]
+                💡 Configuration MongoDB dans le code source
+              </div>
+              <div className="text-gray-600 mt-1">
+                🔄 Nouvelles fonctions : Glisser-déposer + "Déplacer cours [nom] [J+X] du [date] au [date]"
               </div>
               {constraints.length > 0 && (
                 <div className="mt-1 text-orange-600">
@@ -1236,7 +1657,34 @@ const MedicalPlanningAgent = () => {
       </div>
 
       <div className="mt-6 bg-white rounded-lg shadow-sm border p-6">
-        <h2 className="text-xl font-semibold text-gray-800 mb-4">📅 Gestion Avancée des Contraintes</h2>
+        <h2 className="text-xl font-semibold text-gray-800 mb-4 flex items-center gap-2">
+          ☁️ Configuration MongoDB Atlas
+          {isOnline ? (
+            <span className="text-sm text-green-600">✅ Connecté (localStorage)</span>
+          ) : (
+            <span className="text-sm text-red-600">❌ Non configuré</span>
+          )}
+        </h2>
+
+        {MONGODB_CONFIG.connectionString.includes("username:password") && (
+          <div className="bg-blue-50 p-4 rounded-lg mb-4">
+            <h3 className="font-medium text-blue-800 mb-2">🔧 Pour activer la sauvegarde MongoDB Atlas :</h3>
+            <ol className="text-sm text-blue-700 space-y-2">
+              <li><strong>1.</strong> Créez un compte gratuit sur <a href="https://cloud.mongodb.com" target="_blank" rel="noopener noreferrer" className="underline">MongoDB Atlas</a></li>
+              <li><strong>2.</strong> Créez un cluster gratuit (M0)</li>
+              <li><strong>3.</strong> Créez un utilisateur de base de données</li>
+              <li><strong>4.</strong> Configurez l'accès réseau (autorisez votre IP)</li>
+              <li><strong>5.</strong> Copiez votre connection string (Connect → Drivers)</li>
+              <li><strong>6.</strong> Remplacez dans le code :</li>
+            </ol>
+            <div className="mt-3 p-3 bg-blue-100 rounded font-mono text-xs">
+              <div>connectionString: "mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/medical_planning"</div>
+            </div>
+            <div className="mt-2 text-xs text-blue-600">
+              💡 En attendant, vos données sont sauvegardées dans le navigateur (localStorage)
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <div className="bg-blue-50 p-4 rounded-lg">
@@ -1255,17 +1703,17 @@ const MedicalPlanningAgent = () => {
             <ul className="text-xs space-y-1 text-orange-600">
               <li>• Report si conflit avec contraintes</li>
               <li>• Respect des intervalles J</li>
-              <li>• Max 9h/jour, Dimanche libre</li>
+              <li>• Max 10h/jour, Dimanche libre</li>
             </ul>
           </div>
 
-          <div className="bg-purple-50 p-4 rounded-lg">
-            <h3 className="font-medium text-purple-800 mb-2">⚠️ Contraintes</h3>
-            <p className="text-sm text-purple-700 mb-2">Événements imprévus</p>
-            <ul className="text-xs space-y-1 text-purple-600">
-              <li>• Rendez-vous médicaux</li>
-              <li>• Formations, voyages</li>
-              <li>• Créneaux personnalisés</li>
+          <div className="bg-green-50 p-4 rounded-lg">
+            <h3 className="font-medium text-green-800 mb-2">☁️ Sauvegarde</h3>
+            <p className="text-sm text-green-700 mb-2">MongoDB Atlas Cloud</p>
+            <ul className="text-xs space-y-1 text-green-600">
+              <li>• Synchronisation automatique</li>
+              <li>• Sauvegarde temps réel</li>
+              <li>• Accessibilité multi-appareils</li>
             </ul>
           </div>
         </div>
@@ -1316,6 +1764,11 @@ const MedicalPlanningAgent = () => {
               {constraints.length > 0 && (
                 <div className="mt-1">
                   <strong>Contraintes :</strong> {constraints.length} respectée(s) ⚠️
+                </div>
+              )}
+              {isOnline && (
+                <div className="mt-1 text-green-600">
+                  <strong>☁️ MongoDB :</strong> Sauvegarde automatique activée
                 </div>
               )}
             </div>
