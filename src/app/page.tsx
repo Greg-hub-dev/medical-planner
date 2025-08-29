@@ -19,7 +19,7 @@ const MONGODB_CONFIG = {
   // Pour la méthode alternative, utilisez ces paramètres :
   alternativeConfig: {
     // Votre connection string MongoDB (trouvé dans Connect → Drivers)
-    connectionString: "mongodb+srv://drgre:wwe2hcAJf32IdydX@cluster0.7xwuasq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
+    connectionString: process.env.NEXT_PUBLIC_MONGODB_URI || "",
 
   }
 };
@@ -108,6 +108,22 @@ interface TodaySession {
   hours: number;
 }
 
+// MongoDB types
+interface MongoDocument {
+  [key: string]: unknown;
+}
+
+interface MongoResult {
+  documents?: MongoDocument[];
+  insertedIds?: unknown[];
+  deletedCount?: number;
+}
+
+interface MongoRequest {
+  filter?: Record<string, unknown>;
+  documents?: MongoDocument[];
+}
+
 const MedicalPlanningAgent = () => {
   const [courses, setCourses] = useState<Course[]>([]);
   const [constraints, setConstraints] = useState<Constraint[]>([]);
@@ -115,6 +131,11 @@ const MedicalPlanningAgent = () => {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
+  const [stats, setStats] = useState<Stats>({
+    totalCourses: 0,
+    todayHours: 0,
+    completionRate: 0
+  });
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       type: 'ai',
@@ -194,7 +215,7 @@ const MedicalPlanningAgent = () => {
   ];
 
   // MongoDB Connection (simplifié pour demo - nécessite un backend en production)
-  const mongoRequest = async (action: string, collection: string, data: any) => {
+  const mongoRequest = useCallback(async (action: string, collection: string, data: MongoRequest): Promise<MongoResult | null> => {
     if (!MONGODB_CONFIG.connectionString || MONGODB_CONFIG.connectionString.includes("username:password")) {
       console.warn("⚠️ MongoDB Connection String manquant. Utilisation du stockage local.");
       return await handleLocalStorage(action, collection, data);
@@ -215,21 +236,24 @@ const MedicalPlanningAgent = () => {
       setIsOnline(false);
       return await handleLocalStorage(action, collection, data);
     }
-  };
+  }, []);
 
   // Système de backup localStorage
-  const handleLocalStorage = async (action: string, collection: string, data: any) => {
+  const handleLocalStorage = async (action: string, collection: string, data: MongoRequest): Promise<MongoResult | null> => {
     try {
       const key = `medical_planning_${collection}`;
 
       switch (action) {
         case 'find':
           const stored = localStorage.getItem(key);
-          return { documents: stored ? JSON.parse(stored) : [] };
+          return { documents: stored ? JSON.parse(stored) as MongoDocument[] : [] };
 
         case 'insertMany':
-          localStorage.setItem(key, JSON.stringify(data.documents));
-          return { insertedIds: data.documents.map((_: any, i: number) => i) };
+          if (data.documents) {
+            localStorage.setItem(key, JSON.stringify(data.documents));
+            return { insertedIds: data.documents.map((_, i) => i) };
+          }
+          return null;
 
         case 'deleteMany':
           localStorage.removeItem(key);
@@ -244,7 +268,7 @@ const MedicalPlanningAgent = () => {
     }
   };
 
-  const saveCourses = async (coursesData: Course[]) => {
+  const saveCourses = useCallback(async (coursesData: Course[]) => {
     if (coursesData.length === 0) return;
 
     // Convertir les dates en strings pour MongoDB
@@ -263,9 +287,9 @@ const MedicalPlanningAgent = () => {
     await mongoRequest('insertMany', MONGODB_CONFIG.coursesCollection, {
       documents: coursesForDB
     });
-  };
+  }, [mongoRequest]);
 
-  const saveConstraints = async (constraintsData: Constraint[]) => {
+  const saveConstraints = useCallback(async (constraintsData: Constraint[]) => {
     if (constraintsData.length === 0) return;
 
     // Convertir les dates en strings pour MongoDB
@@ -280,35 +304,45 @@ const MedicalPlanningAgent = () => {
     await mongoRequest('insertMany', MONGODB_CONFIG.constraintsCollection, {
       documents: constraintsForDB
     });
-  };
+  }, [mongoRequest]);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setIsLoading(true);
 
     try {
       // Charger les cours
       const coursesResult = await mongoRequest('find', MONGODB_CONFIG.coursesCollection, { filter: {} });
       if (coursesResult?.documents) {
-        const coursesFromDB = coursesResult.documents.map((course: any) => ({
+        const coursesFromDB = coursesResult.documents.map((course: MongoDocument) => ({
           ...course,
-          createdAt: new Date(course.createdAt),
-          sessions: course.sessions.map((session: any) => ({
+          createdAt: new Date(course.createdAt as string),
+          sessions: (course.sessions as Array<{
+            id: string;
+            date: string;
+            originalDate: string;
+            interval: string;
+            intervalLabel: string;
+            completed: boolean;
+            success: boolean | null;
+            color: string;
+            rescheduled: boolean;
+          }>).map((session) => ({
             ...session,
             date: new Date(session.date),
             originalDate: new Date(session.originalDate)
           }))
-        }));
+        })) as Course[];
         setCourses(coursesFromDB);
       }
 
       // Charger les contraintes
       const constraintsResult = await mongoRequest('find', MONGODB_CONFIG.constraintsCollection, { filter: {} });
       if (constraintsResult?.documents) {
-        const constraintsFromDB = constraintsResult.documents.map((constraint: any) => ({
+        const constraintsFromDB = constraintsResult.documents.map((constraint: MongoDocument) => ({
           ...constraint,
-          date: new Date(constraint.date),
-          createdAt: new Date(constraint.createdAt)
-        }));
+          date: new Date(constraint.date as string),
+          createdAt: new Date(constraint.createdAt as string)
+        })) as Constraint[];
         setConstraints(constraintsFromDB);
       }
 
@@ -323,7 +357,7 @@ const MedicalPlanningAgent = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [mongoRequest]);
 
   const createConstraint = (date: string | Date, startHour: number, endHour: number, description: string): Constraint => {
     return {
@@ -486,31 +520,6 @@ const MedicalPlanningAgent = () => {
 
     setCourses(updatedCourses);
     saveCourses(updatedCourses);
-  };
-
-  const moveCourseSession = (courseName: string, sessionInterval: string, fromDate: Date, toDate: Date): boolean => {
-    const course = courses.find(c => c.name.toLowerCase().includes(courseName.toLowerCase()));
-    if (!course) return false;
-
-    const session = course.sessions.find(s =>
-      s.interval === sessionInterval &&
-      s.date.toDateString() === fromDate.toDateString()
-    );
-
-    if (!session) return false;
-
-    // Vérifier les conflits à la nouvelle date
-    if (hasConflict(toDate, course.hoursPerDay)) {
-      return false;
-    }
-
-    // Vérifier si le dimanche
-    if (toDate.getDay() === 0) {
-      toDate.setDate(toDate.getDate() + 1);
-    }
-
-    moveSession(course.id, session.id, toDate);
-    return true;
   };
 
   const rebalanceSessions = (coursesToBalance: Course[]): Course[] => {
@@ -894,7 +903,7 @@ const MedicalPlanningAgent = () => {
           });
         });
 
-        return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n☁️ Sauvegardé automatiquement\n\n🔄 Réorganisation automatique effectuée :\n• ${affectedSessions} session(s) de cours reportée(s)\n• Toutes les sessions en conflit ont été décalées\n• Les règles de planning sont respectées (Lundi-Samedi, max 10h/jour)\n\n💡 Consultez votre planning mis à jour avec "Planning de la semaine"`;
+        return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n☁️ Sauvegardé automatiquement\n\n🔄 Réorganisation automatique effectuée :\n• ${affectedSessions} session(s) de cours reportée(s)\n• Toutes les sessions en conflit ont été décalées\n• Les règles de planning sont respectées (Lundi-Samedi, max 9h/jour)\n\n💡 Consultez votre planning mis à jour avec "Planning de la semaine"`;
       }
 
       return `⚠️ Contrainte ajoutée avec succès !\n\n📅 ${description} le ${constraintDate.toLocaleDateString('fr-FR')} de ${startHour}h à ${endHour}h\n☁️ Sauvegardé automatiquement\n\n💡 Ajoutez des cours et ils seront automatiquement programmés en évitant cette période !`;
@@ -1130,21 +1139,21 @@ const MedicalPlanningAgent = () => {
   // Charger les données au démarrage
   useEffect(() => {
     loadData();
-  }, []);
+  }, [loadData]);
 
   // Sauvegarder automatiquement les cours quand ils changent
   useEffect(() => {
     if (courses.length > 0 && !isLoading) {
       saveCourses(courses);
     }
-  }, [courses, isLoading]);
+  }, [courses, isLoading, saveCourses]);
 
   // Sauvegarder automatiquement les contraintes quand elles changent
   useEffect(() => {
     if (constraints.length > 0 && !isLoading) {
       saveConstraints(constraints);
     }
-  }, [constraints, isLoading]);
+  }, [constraints, isLoading, saveConstraints]);
 
   useEffect(() => {
     const todayHours = getTodaySessions().reduce((sum, s) => sum + s.hours, 0);
@@ -1217,7 +1226,7 @@ const MedicalPlanningAgent = () => {
             <div className="bg-white p-4 rounded-lg shadow-sm border">
               <div className="flex items-center gap-2 mb-2">
                 <Clock className="w-5 h-5 text-green-600" />
-                <span className="text-sm font-medium">Aujourd&apos;hui</span>
+                <span className="text-sm font-medium">Aujourd hui</span>
               </div>
               <div className="text-2xl font-bold text-gray-800">{stats.todayHours}h</div>
             </div>
@@ -1261,7 +1270,7 @@ const MedicalPlanningAgent = () => {
                         </div>
                         <button
                           onClick={() => {
-                            const confirmDelete = window.confirm(`Supprimer le cours "${course.name}" et toutes ses sessions ?`);
+                            const confirmDelete = window.confirm(`Supprimer le cours ${course.name} et toutes ses sessions ?`);
                             if (confirmDelete) {
                               deleteCourse(course.id);
                             }
@@ -1296,7 +1305,7 @@ const MedicalPlanningAgent = () => {
                                 <div className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                   <button
                                     onClick={() => {
-                                      const confirmDelete = window.confirm(`Supprimer la session ${session.interval} du cours "${course.name}" ?`);
+                                      const confirmDelete = window.confirm(`Supprimer la session ${session.interval} du cours ${course.name} ?`);
                                       if (confirmDelete) {
                                         deleteSession(course.id, session.id);
                                       }
@@ -1339,7 +1348,7 @@ const MedicalPlanningAgent = () => {
                         <button
                           onClick={() => {
                             const incompleteSessions = course.sessions.filter(s => !s.completed);
-                            const confirmDelete = window.confirm(`Supprimer toutes les sessions incomplètes de "${course.name}" (${incompleteSessions.length} sessions) ?`);
+                            const confirmDelete = window.confirm(`Supprimer toutes les sessions incomplètes de ${course.name} (${incompleteSessions.length} sessions) ?`);
                             if (confirmDelete) {
                               incompleteSessions.forEach(session => {
                                 deleteSession(course.id, session.id);
@@ -1486,7 +1495,7 @@ const MedicalPlanningAgent = () => {
                                 <div className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                   <button
                                     onClick={() => {
-                                      const confirmDelete = window.confirm(`Supprimer la session ${session.intervalLabel} de "${session.course}" du ${dayData.date.toLocaleDateString('fr-FR')} ?`);
+                                      const confirmDelete = window.confirm(`Supprimer la session ${session.intervalLabel} de ${session.course} du ${dayData.date.toLocaleDateString('fr-FR')} ?`);
                                       if (confirmDelete) {
                                         deleteSession(correspondingCourse.id, correspondingSession.id);
                                       }
@@ -1530,7 +1539,7 @@ const MedicalPlanningAgent = () => {
                   ➕ Anatomie (2h/jour)
                 </button>
                 <button
-                  onClick={() => setInputMessage('J\'ai une contrainte le 15/03 de 9h à 12h')}
+                  onClick={() => setInputMessage('J ai une contrainte le 15/03 de 9h à 12h')}
                   className="block w-full p-3 bg-red-50 hover:bg-red-100 rounded-lg text-red-700 font-medium"
                 >
                   ⚠️ Ajouter une contrainte
@@ -1593,7 +1602,7 @@ const MedicalPlanningAgent = () => {
                 ➕ Nouveau cours
               </button>
               <button
-                onClick={() => setInputMessage('J\'ai une contrainte le 15/03 de 9h à 12h')}
+                onClick={() => setInputMessage('J ai une contrainte le 15/03 de 9h à 12h')}
                 className="text-xs p-2 bg-red-50 hover:bg-red-100 rounded border text-red-700"
               >
                 ⚠️ Contrainte
@@ -1644,7 +1653,7 @@ const MedicalPlanningAgent = () => {
                 💡 Configuration MongoDB dans le code source
               </div>
               <div className="text-gray-600 mt-1">
-                🔄 Nouvelles fonctions : Glisser-déposer + "Déplacer cours [nom] [J+X] du [date] au [date]"
+                🔄 Nouvelles fonctions : Glisser-déposer + Déplacer cours [nom] [J+X] du [date] au [date]
               </div>
               {constraints.length > 0 && (
                 <div className="mt-1 text-orange-600">
@@ -1673,12 +1682,12 @@ const MedicalPlanningAgent = () => {
               <li><strong>1.</strong> Créez un compte gratuit sur <a href="https://cloud.mongodb.com" target="_blank" rel="noopener noreferrer" className="underline">MongoDB Atlas</a></li>
               <li><strong>2.</strong> Créez un cluster gratuit (M0)</li>
               <li><strong>3.</strong> Créez un utilisateur de base de données</li>
-              <li><strong>4.</strong> Configurez l'accès réseau (autorisez votre IP)</li>
+              <li><strong>4.</strong> Configurez l accès réseau (autorisez votre IP)</li>
               <li><strong>5.</strong> Copiez votre connection string (Connect → Drivers)</li>
               <li><strong>6.</strong> Remplacez dans le code :</li>
             </ol>
             <div className="mt-3 p-3 bg-blue-100 rounded font-mono text-xs">
-              <div>connectionString: "mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/medical_planning"</div>
+              <div>connectionString: mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/medical_planning;</div>
             </div>
             <div className="mt-2 text-xs text-blue-600">
               💡 En attendant, vos données sont sauvegardées dans le navigateur (localStorage)
@@ -1703,7 +1712,7 @@ const MedicalPlanningAgent = () => {
             <ul className="text-xs space-y-1 text-orange-600">
               <li>• Report si conflit avec contraintes</li>
               <li>• Respect des intervalles J</li>
-              <li>• Max 10h/jour, Dimanche libre</li>
+              <li>• Max 9h/jour, Dimanche libre</li>
             </ul>
           </div>
 
